@@ -23,6 +23,7 @@ import sys
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
+from functools import partial
 from pathlib import Path
 from threading import RLock
 from types import MappingProxyType
@@ -601,6 +602,7 @@ def load_composite_bindings(
     dp_size=None,
     dspark_lowering_provider=None,
     request_slots=1,
+    prefill_ep_backend="native",
 ) -> CompositeBindings:
     """Resolve the model-specific contract without opening a device."""
     if model_dir is None or max_seq_len is None:
@@ -612,6 +614,7 @@ def load_composite_bindings(
         dp_size=dp_size,
         dspark_lowering_provider=dspark_lowering_provider,
         request_slots=request_slots,
+        prefill_ep_backend=prefill_ep_backend,
     )
 
 
@@ -1571,24 +1574,39 @@ class V41ModelRunner:
                 ledger.abort(step, self._reset_request)
                 raise
 
-def compile_prefill_fwd(compiler, lib_root, topology):
+def compile_prefill_fwd(
+    compiler, lib_root, topology, *, moe_tokens=None, layout="native", copy_cost_tiles=2, route_trace_mode="off",
+):
     """Compile the lib's complete CED prefill at the serving row capacity."""
     decode_topology = SegmentTopology.for_decode(tp=topology.tp, dp=topology.dp)
+    if moe_tokens is None:
+        moe_tokens = decode_topology.local_capacity
     load_segment_modules(lib_root, decode_topology)
     previous_argv = sys.argv[:]
     try:
         sys.argv = [previous_argv[0], "--tp", str(topology.tp), "--ep", str(topology.world),
                     "--dp", str(topology.dp), "--capacity", str(topology.local_capacity),
-                    "--moe-tokens", str(decode_topology.local_capacity)]
+                    "--moe-tokens", str(moe_tokens), "--moonep-layout", layout,
+                    "--moonep-copy-cost-tiles", str(copy_cost_tiles),
+                    "--moonep-route-mode", route_trace_mode]
         module = importlib.import_module("models.deepseek_v4_1_flash.prefill_fwd")
     finally:
         sys.argv = previous_argv
     if (module.CAPACITY, module.RANKS) != (topology.local_capacity, topology.world):
         raise ValueError("lib prefill_fwd was imported for another capacity or EP topology")
-    if module.MOE_TOKENS != decode_topology.local_capacity:
-        raise ValueError("lib prefill MoE extent disagrees with the shared decode kernels")
+    if module.MOE_TOKENS != moe_tokens:
+        raise ValueError("lib prefill_fwd was imported with another MoE extent")
+    if getattr(module, "MOONEP_LAYOUT", 0) != ("native", "fixed", "compact", "online", "preplaced", "planned").index(layout):
+        raise MissingCompositeInterface("lib prefill_fwd does not match the requested V4.1 prefill EP layout")
+    if layout in ("online", "planned") and module.MOONEP_COPY_COST_TILES != copy_cost_tiles:
+        raise ValueError("lib prefill_fwd was imported with another MoonEP copy cost")
+    if getattr(module, "ROUTE_TRACE_MODE", 0) != ("off", "record", "replay").index(route_trace_mode):
+        raise MissingCompositeInterface("lib prefill_fwd does not match the requested route trace mode")
     entry = module.l3_prefill_fwd
-    return compiler.compile("v41_prefill_fwd", entry), tuple(entry.param_names)
+    program_name = "v41_prefill_fwd" if layout == "native" else f"v41_prefill_fwd_moonep_{layout}"
+    if route_trace_mode != "off":
+        program_name += f"_routes_{route_trace_mode}"
+    return compiler.compile(program_name, entry), tuple(entry.param_names)
 
 
 # segment_inputs
@@ -2025,7 +2043,10 @@ class PrefillMetadataResources:
 
     def __init__(self, topology, *, max_seq_len, max_requests, window_pages,
                  c2a_pages, c1a_pages, rope_tables, compressed_rope_tables,
-                 full_hidden_size=None, dspark_hidden_size=None, engram_k=6144):
+                 full_hidden_size=None, dspark_hidden_size=None, engram_k=6144,
+                 moe_tokens=None, trim_empty_moe_rounds=False,
+                 route_trace_shape=None, route_trace_dir=None, route_trace_loader=None,
+                 route_trace_layout="native", route_trace_checker=None):
         if any(type(value) is not int or value <= 0 for value in
                (max_seq_len, max_requests, window_pages, c2a_pages, c1a_pages)):
             raise ValueError("prefill metadata capacities must be positive integers")
@@ -2041,6 +2062,13 @@ class PrefillMetadataResources:
         self.compressed_pages = {"c2a": c2a_pages, "c1a": c1a_pages}
         self.fields = {}
         self.full_hidden_size = full_hidden_size
+        self.moe_tokens = moe_tokens
+        self.trim_empty_moe_rounds = trim_empty_moe_rounds
+        self.route_trace_dir = route_trace_dir
+        self.route_trace_loader = route_trace_loader
+        self.route_trace_layout = route_trace_layout
+        self.route_trace_checker = route_trace_checker
+        self.route_trace_index = 0
         if full_hidden_size is not None and (type(full_hidden_size) is not int or full_hidden_size <= 0):
             raise ValueError("full prefill hidden size must be positive")
         if dspark_hidden_size is not None and (
@@ -2100,6 +2128,10 @@ class PrefillMetadataResources:
             shared("full_initial_pre", (world, tokens, 4), torch.float32)
             shared("full_identity_rows", (world, tokens), torch.int32, -1)
             shared("full_counts", (world, 2), torch.int32)
+            if moe_tokens is not None:
+                shared("moe_rounds", (world, 2), torch.int32, math.ceil(tokens / moe_tokens))
+            if route_trace_shape is not None:
+                shared("route_trace", (world, *route_trace_shape), torch.float32)
             shared("full_replay_rows", (world, tokens), torch.int32, -1)
             shared("full_position_ids", (world, 2, tokens), torch.int32, -1)
             shared("full_window_slots", (world, 2, tokens), torch.int64, -1)
@@ -2171,14 +2203,22 @@ class PrefillMetadataResources:
 
     def stage_full(self, step, embeddings, engram=None):
         """Lower one chunk into the two-stage lib prefill ABI using scheduler pages."""
-        with profile_span('v41.PrefillMetadataResources.stage_full', cat='v41.host', level='verbose'):
+        profile_args = {}
+        with profile_span('v41.PrefillMetadataResources.stage_full', cat='v41.host', level='verbose',
+                          args=profile_args):
             if self.full_hidden_size is None:
                 raise ValueError("full prefill staging was not allocated before worker startup")
             if embeddings.shape[-1] != self.full_hidden_size:
                 raise ValueError("full prefill embedding width disagrees with the checkpoint")
             counts = self.stage(step, engram)
+            profile_args["rows_per_rank"] = counts
             packed = prepare_segment_inputs(embeddings, step, self.topology)
             f = self.fields
+            if self.trim_empty_moe_rounds:
+                # Full causal replay uses the same active row counts in both stages.
+                rounds = math.ceil(max(counts) / self.moe_tokens)
+                f["moe_rounds"].fill_(rounds)
+                profile_args["moe_rounds"] = rounds
             f["full_embedding"].zero_()
             active = packed.row_indices >= 0
             f["full_embedding"][active] = embeddings[packed.row_indices[active]]
@@ -2193,6 +2233,10 @@ class PrefillMetadataResources:
                 f["full_counts"][rank] = count
                 f["full_identity_rows"][rank, :count] = torch.arange(count, dtype=torch.int32)
                 f["full_replay_rows"][rank, :count] = torch.arange(count, dtype=torch.int32)
+            if self.route_trace_loader is not None:
+                path = self.route_trace_dir / f"prefill-{self.route_trace_index:06d}.pt"
+                trace = f["route_trace"]
+                trace.copy_(self.route_trace_loader(path, f["full_counts"], trace.shape, 384))
             for stage, family in enumerate(("c2a", "c1a")):
                 f["full_position_ids"][:, stage].copy_(f[family + "_position_ids"])
                 f["full_window_slots"][:, stage].copy_(f["window_slots"])
@@ -2211,6 +2255,20 @@ class PrefillMetadataResources:
                 rows_per_rank[rank] += len(request.token_ids)
                 per_rank[rank] += 1
             return counts
+
+    def finish_route_trace(self):
+        if self.route_trace_dir is None:
+            return
+        if self.route_trace_loader is None:
+            path = self.route_trace_dir / f"prefill-{self.route_trace_index:06d}.pt"
+            torch.save({
+                "counts": self.fields["full_counts"],
+                "routes": self.fields["route_trace"],
+                "layout": self.route_trace_layout,
+            }, path)
+        if self.route_trace_checker is not None:
+            self.route_trace_checker(self.fields["route_trace"], self.fields["full_counts"], self.moe_tokens)
+        self.route_trace_index += 1
 
     def full_arguments(self):
         if self.full_hidden_size is None:
@@ -2233,7 +2291,7 @@ class PrefillMetadataResources:
             "c1a_compressed_slots": "c1a_compressed_slots",
             "state_block_table": "c2a_state_block_table",
         }
-        for name in ("engram_lookup", "dspark_target_hidden"):
+        for name in ("engram_lookup", "dspark_target_hidden", "moe_rounds", "route_trace"):
             if name in f:
                 names[name] = name
         return {name: f[source] for name, source in names.items()}
@@ -2403,6 +2461,7 @@ class PrefillForwardSegment:
                     self.worker.run(self.program.compiled,
                                     *(self.arguments[name] for name in self.param_names),
                                     config=self.run_config)
+                self.metadata.finish_route_trace()
             except BaseException:
                 self.failed = True
                 raise
@@ -3719,7 +3778,28 @@ def make_production_bindings(
     dp_size=None,
     dspark_lowering_provider=None,
     request_slots=1,
+    prefill_ep_backend="native",
 ):
+    if prefill_ep_backend not in ("native", "moonep"):
+        raise ValueError("V4.1 prefill EP backend must be native or moonep")
+    prefill_layout = "native"
+    copy_cost_tiles = 2
+    if prefill_ep_backend == "moonep":
+        prefill_layout = os.environ.get("PYPTO_V41_PREFILL_MOONEP_LAYOUT", "compact")
+        if prefill_layout not in ("fixed", "compact", "online", "preplaced", "planned"):
+            raise ValueError("invalid PYPTO_V41_PREFILL_MOONEP_LAYOUT")
+        if prefill_layout in ("online", "planned"):
+            copy_cost_tiles = int(os.environ.get("PYPTO_V41_PREFILL_MOONEP_COPY_COST_TILES", "2"))
+            if copy_cost_tiles < 0:
+                raise ValueError("PYPTO_V41_PREFILL_MOONEP_COPY_COST_TILES must be nonnegative")
+    trace_dir_setting = os.environ.get("PYPTO_V41_PREFILL_ROUTE_TRACE_DIR")
+    replay_dir_setting = os.environ.get("PYPTO_V41_PREFILL_ROUTE_REPLAY_DIR")
+    if trace_dir_setting and replay_dir_setting:
+        raise ValueError("V4.1 prefill trace capture and replay are mutually exclusive")
+    trace_mode = "replay" if replay_dir_setting else "record" if trace_dir_setting else "off"
+    trace_dir = Path(replay_dir_setting or trace_dir_setting).resolve() if trace_mode != "off" else None
+    if prefill_layout in ("preplaced", "planned") and trace_mode != "replay":
+        raise ValueError("preplaced and planned MoonEP modes require PYPTO_V41_PREFILL_ROUTE_REPLAY_DIR")
     model_dir = Path(model_dir).resolve()
     raw = json.loads((model_dir / "config.json").read_text(encoding="utf-8"))
     layers = plan_layers(raw)
@@ -3731,6 +3811,14 @@ def make_production_bindings(
     root = _lib_root()
     revision = _revision(root)
     topology = selected_decode_topology(root, dp_size=dp_size)
+    prefill_moe_tokens = topology.local_capacity
+    width_setting = os.environ.get("PYPTO_V41_PREFILL_MOE_TOKENS")
+    if width_setting is not None:
+        if prefill_layout != "compact" or topology.world != 4:
+            raise ValueError("PYPTO_V41_PREFILL_MOE_TOKENS requires EP4 MoonEP compact")
+        prefill_moe_tokens = int(width_setting)
+        if not 16 <= prefill_moe_tokens <= 256 or prefill_moe_tokens % 16:
+            raise ValueError("PYPTO_V41_PREFILL_MOE_TOKENS must be between 16 and 256 and divisible by 16")
 
     def allocate(plan, device_ids, runtime, options):
         from pypto_serving.model.common.compiler.compiler import KernelCompiler
@@ -3778,7 +3866,29 @@ def make_production_bindings(
                 compiler, root, topology)
         else:
             dspark_programs, dspark_param_names = {}, {}
-        prefill, prefill_names = compile_prefill_fwd(compiler, root, prefill_topology)
+        moe_tokens = min(prefill_topology.local_capacity, prefill_moe_tokens)
+        prefill, prefill_names = compile_prefill_fwd(
+            compiler, root, prefill_topology, moe_tokens=moe_tokens, layout=prefill_layout, copy_cost_tiles=copy_cost_tiles,
+            route_trace_mode=trace_mode)
+        if "moe_rounds" not in prefill_names:
+            moe_tokens = None
+        trim_empty_moe_rounds = prefill_layout != "native" or os.environ.get("PYPTO_V41_PREFILL_TRIM_EMPTY_ROUNDS") == "1"
+        if trim_empty_moe_rounds and moe_tokens is None:
+            raise MissingCompositeInterface("V4.1 prefill MoE round trimming requires a lib with the moe_rounds input")
+        route_trace_shape = None
+        route_trace_loader = None
+        route_trace_checker = None
+        if "route_trace" in prefill_names:
+            prefill_abi = importlib.import_module("models.deepseek_v4_1_flash.prefill_fwd")
+            route_trace_shape = (prefill_abi.TRACE_LAYERS, prefill_abi.TRACE_ROWS, prefill_abi.TRACE_WIDTH)
+        if trace_mode == "record":
+            trace_dir.mkdir(parents=True, exist_ok=True)
+        elif trace_mode == "replay":
+            route_replay = importlib.import_module("models.deepseek_v4_1_flash.route_replay")
+            placement_tokens = moe_tokens if prefill_layout in ("preplaced", "planned") else None
+            route_trace_loader = partial(route_replay.read_route_trace, placement_tokens=placement_tokens)
+            if prefill_layout == "planned":
+                route_trace_checker = route_replay.validate_planner_result
         abi = importlib.import_module("models.deepseek_v4_1_flash.decode_fwd")
         kv_sources, index_sources, c2a_sources = _sources(layers)
         layout = DecodeWeightLayout.from_lib(abi, tp_size=topology.tp)
@@ -3852,7 +3962,10 @@ def make_production_bindings(
         decode_input_host = make_input_host_resources(topology, plan.weights.config.hidden_size)
         final_host = load_final_output_host_resources(model_dir, topology)
         prefill_host = PrefillMetadataResources(
-            prefill_topology, **host_kwargs, full_hidden_size=plan.weights.config.hidden_size)
+            prefill_topology, **host_kwargs, full_hidden_size=plan.weights.config.hidden_size,
+            moe_tokens=moe_tokens, trim_empty_moe_rounds=trim_empty_moe_rounds,
+            route_trace_shape=route_trace_shape, route_trace_dir=trace_dir, route_trace_loader=route_trace_loader,
+            route_trace_layout=prefill_layout, route_trace_checker=route_trace_checker)
         engram_host = None
         if "engram_lookup" in set(decode_names) | set(prefill_names):
             tokenizer_adapter = tokenizer

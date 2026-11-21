@@ -159,6 +159,7 @@ def build_prompt(tokenizer, target: int, seed: int) -> str:
 
 def read_stream(response, request_start: float) -> dict:
     first_token = None
+    last_token = None
     usage = None
     finish_reason = None
     done = False
@@ -182,14 +183,18 @@ def read_stream(response, request_start: float) -> dict:
         if chunk.get("usage") is not None:
             usage = chunk["usage"]
         for choice in chunk.get("choices", []):
-            if choice.get("text") and first_token is None:
-                first_token = time.monotonic() - request_start
+            delta = choice.get("delta") or {}
+            if choice.get("text") or delta.get("content") or delta.get("reasoning") or delta.get("reasoning_content"):
+                last_token = time.monotonic() - request_start
+                if first_token is None:
+                    first_token = last_token
             if choice.get("finish_reason") is not None:
                 finish_reason = choice["finish_reason"]
     if not done or usage is None or first_token is None:
         raise ValueError("incomplete stream: missing [DONE], usage, or first output token")
     return {
         "ttft_s": first_token,
+        "last_token_s": last_token,
         "latency_s": time.monotonic() - request_start,
         "usage": usage,
         "finish_reason": finish_reason,

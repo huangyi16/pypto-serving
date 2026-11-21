@@ -146,13 +146,14 @@ class DeepSeekV41DirectoryLoader(SafetensorsDirectoryLoader):
 class DeepSeekV41PyptoExecutor(ModelExecutor):
     """Shared worker interface with a synchronous, collective V4.1 runner."""
     def __init__(self, kv_cache_manager=None, *, platform="a5", device_ids=tuple(range(8)),
-                 pypto_build_dir=None, bindings=None,
+                 pypto_build_dir=None, bindings=None, prefill_ep_backend="native",
                  dspark_lowering_provider: DSparkLoweringProvider | None = None):
         super().__init__(kv_cache_manager)
         if platform != "a5":
             raise ValueError("V4.1 M0 currently requires the A5 platform")
         self.device_ids = tuple(device_ids)
         self.bindings = bindings
+        self.prefill_ep_backend = prefill_ep_backend
         self.runners = {}
         self._failed_runners = []
         self.platform = platform
@@ -173,7 +174,7 @@ class DeepSeekV41PyptoExecutor(ModelExecutor):
             record.runtime_model.extra["model_dir"], record.runtime.max_seq_len,
             tokenizer=record.tokenizer, dp_size=dp_size,
             dspark_lowering_provider=self.dspark_lowering_provider,
-            request_slots=request_slots)
+            request_slots=request_slots, prefill_ep_backend=self.prefill_ep_backend)
         if not bindings.cache_groups:
             raise MissingCompositeInterface("V4.1 requires explicit grouped cache layouts and capacities")
         if record.runtime.kv_cache_groups != bindings.cache_groups:

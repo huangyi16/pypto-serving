@@ -60,6 +60,7 @@ Leave `PYPTO_PROG_BUILD_DIR` unset for reuse; setting it requests explicit build
 | `--data-parallel-size`, `--dp` | `1` | Data-parallel size. |
 | `--tensor-parallel-size`, `--tp` | `1` | Tensor-parallel group size. |
 | `--expert-parallel-size`, `--ep` | `1` | Expert-parallel size where supported by the model. |
+| `--v41-prefill-ep-backend` | `native` | V4.1 A5 prefill expert-parallel backend. Accepts `native` and `moonep`. |
 | `--data-parallel-routing` | `least_pending_tokens` | DP request routing policy. |
 
 Device count and the meaning of each parallel axis depend on the model's placement mode. Replica placement uses `dp * tp` devices; overlapped placement can reuse ranks across parallel axes. See [Parallelism and Scaling](../user-guide/parallel.md) and the model guide for supported topologies.

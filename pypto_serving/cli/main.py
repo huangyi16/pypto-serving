@@ -108,6 +108,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--kv-cache-dtype", default="bfloat16", help="KV cache data type. 'auto' follows --dtype (default: bfloat16).")
 
     # Runtime
+    parser.add_argument(
+        "--v41-prefill-ep-backend", choices=("native", "moonep"), default="native",
+        help="DeepSeek V4.1 A5 prefill expert-parallel backend.",
+    )
     parser.add_argument("--kv-offload-bytes", type=int, default=0,
                         help="Instance-wide DDR prefix-cache capacity in bytes; zero disables offload.")
     parser.add_argument("--kv-offload-backend", choices=("simpler",), default="simpler",
@@ -305,6 +309,8 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
         args.max_num_batched_tokens = 1024 if model_family == "deepseek_v41" else 4096
     if model_family == "deepseek_v41":
         return _build_v41_engine_config(args, model_dir, model_config_data, devices)
+    if getattr(args, "v41_prefill_ep_backend", "native") != "native":
+        raise ValueError("--v41-prefill-ep-backend is supported only for DeepSeek V4.1")
     model_variant = _resolve_model_variant(args)
     _validate_prefill_chunk_size(
         model_family,
@@ -429,8 +435,10 @@ def _build_v41_engine_config(args, model_dir, raw, devices):
     if args.max_num_seqs > 12 * dp_size:
         raise ValueError("V4.1 supports at most 12 requests per DP partition")
     request_slots = (args.max_num_seqs + dp_size - 1) // dp_size
+    prefill_ep_backend = getattr(args, "v41_prefill_ep_backend", "native")
     bindings = load_composite_bindings(
-        model_dir, args.max_model_len, dp_size=dp_size, request_slots=request_slots)
+        model_dir, args.max_model_len, dp_size=dp_size, request_slots=request_slots,
+        prefill_ep_backend=prefill_ep_backend)
     bindings.require(plan_layers(raw), RankPlacement(0, tp_size=1, dp_size=dp_size, ep_size=dp_size))
     if bindings.segment_topology is None:
         raise MissingCompositeInterface("V4.1 bindings must declare the selected lib decode capacity")
@@ -460,6 +468,7 @@ def _build_v41_engine_config(args, model_dir, raw, devices):
         device_ids=devices,
         parallel_config=parallel,
         executor_cls=_executor_cls_for_model_family("deepseek_v41"),
+        executor_kwargs={"prefill_ep_backend": prefill_ep_backend},
         runtime_config=runtime,
         profile_config=_build_profile_config(args),
         max_num_running_reqs=args.max_num_seqs,

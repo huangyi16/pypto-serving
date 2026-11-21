@@ -73,7 +73,8 @@ def test_v41_dp4_http_answer(tmp_path, num_speculative_tokens):
     prompt_tokens = int(os.environ.get("PYPTO_DSV41_PROMPT_TOKENS", str(min(8192, 3 * prefill_tokens))))
     assert prefill_tokens < prompt_tokens <= 8192
     devices = tuple(part.strip() for part in os.environ.get("TASK_DEVICE", "").split(","))
-    assert len(devices) == 4 and len(set(devices)) == 4 and all(part.isdecimal() for part in devices)
+    world = len(devices)
+    assert world in (4, 8) and len(set(devices)) == world and all(part.isdecimal() for part in devices)
 
     from pypto_serving.model.tokenizer import load_tokenizer
 
@@ -84,11 +85,12 @@ def test_v41_dp4_http_answer(tmp_path, num_speculative_tokens):
     command = [
         sys.executable, "-m", "pypto_serving.cli", "--model", str(model_dir),
         "--served-model-name", MODEL_NAME, "--backend", "npu", "--platform", "a5",
-        "--devices", ",".join(devices), "--tp", "1", "--dp", "4", "--ep", "4",
+        "--devices", ",".join(devices), "--tp", "1", "--dp", str(world), "--ep", str(world),
         "--block-size", "128", "--max-model-len", "8320", "--max-num-seqs", "8",
         "--max-num-batched-tokens", str(prefill_tokens), "--host", "127.0.0.1", "--port", str(port),
         "--enable-chunked-prefill", "--long-prefill-token-threshold", str(prefill_tokens),
-        "--show-startup-logs",
+        "--show-startup-logs", "--v41-prefill-ep-backend",
+        os.environ.get("PYPTO_DSV41_PREFILL_EP_BACKEND", "native"),
     ]
     env = os.environ.copy()
     metrics_dir = tmp_path / "decode-metrics"
