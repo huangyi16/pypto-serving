@@ -124,4 +124,8 @@ nav:
       - Model Integration: developer-guide/model-integration.md
       - Weight Staging: developer-guide/weight-staging.md
       - V4.1 Engram and Decode Optimization: developer-guide/v41-engram-decode-optimization.md
+      - V4.1 A5 MoonEP Prefill Design: developer-guide/v41-a5-moonep-prefill-design.md
+      - V4.1 A5 MoonEP Tuning: developer-guide/v41-a5-moonep-tuning.md
+      - V4.1 A5 EP4 Optimization Log: developer-guide/v41-a5-ep4-optimization-log.md
+      - V4.1 A5 EP4 Handoff: developer-guide/v41-a5-ep4-handoff.md
       - JIT Cache: developer-guide/jit-cache.md

@@ -27,6 +27,14 @@ The 256-row EP4 benchmark uses `PYPTO_V41_PREFILL_MOE_TOKENS=256` with
 budget. Use the same checkpoint sidecar and scheduler settings for the native
 comparison.
 
+The recorded 31.47% improvement compares 256-row compact with 80-row locked
+native and measures the combined configuration. Isolating the transport
+requires matching the source revision, MoE width and empty-round trimming
+across arms. In the matched 256-row EP4 run, corrected native and the
+Prefill 14 compact prototype measured 1.506 s and 1.453 s at Prefill P50,
+a 3.53% reduction for that prototype.
+See the [Prefill 15b comparison](v41-a5-ep4-optimization-log.md#prefill-15b--correct-wide-native-scatter-before-comparison).
+
 Select the backend with `--v41-prefill-ep-backend`. The defaults are `native` for Serving and `compact` when MoonEP is selected. F through D trim empty tail rounds. The planner currently selects at most one move per round, using one allocated slot per rank. Its cold-copy penalty is measured in 64-row compute tiles and defaults to 2. Sweep `PYPTO_V41_PREFILL_MOONEP_COPY_COST_TILES` in D and use the capture's value in C. The slot state is retired at the layer boundary. The D path uses a single bank. A copy stores 18,800,640 bytes of packed payload and MX scales. Compact input segments use 32-row alignment. The initial histogram exchange gives every rank the same source-by-expert counts.
 
 ## Verify the device path before timing
