@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from pypto_serving.model.common.moe_offload import EXPERT_METADATA
 from pypto_serving.model.common.runner.buffer_set import (
     ClearPolicy,
     Placement,
@@ -543,7 +544,8 @@ def prefill_task_args(
     cache_pools = set(_PREFILL_CACHE_POOLS)
 
     ta = DeepSeekPrefillTaskArgs(layout.ranks)
-    for name in _PREFILL_FWD_TENSOR_ORDER:
+    extra = EXPERT_METADATA if runner._compiled.expert_cache_bytes else ()
+    for name in _PREFILL_FWD_TENSOR_ORDER + extra:
         if name in slot_specs:
             dtype, shape, clear = slot_specs[name]
             ta.add_slot(Slot(name, Placement.HOST_SHARED, dtype, lambda _, s=shape: s, clear=clear))
@@ -613,7 +615,8 @@ def decode_task_args(
     static_weights = set(_DECODE_STATIC_WEIGHTS)
     cache_pools = set(_DECODE_CACHE_POOLS)
     ta = TaskArgs(stacked=True)
-    for name in _DECODE_FWD_TENSOR_ORDER:
+    extra = EXPERT_METADATA if runner._compiled.expert_cache_bytes else ()
+    for name in _DECODE_FWD_TENSOR_ORDER + extra:
         if name in slot_specs:
             dtype, shape = slot_specs[name]
             placement = (

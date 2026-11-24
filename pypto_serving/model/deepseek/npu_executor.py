@@ -24,9 +24,10 @@ from pypto_serving.model.common.compiler.compiler import KernelCompiler
 from pypto_serving.model.common.executor.pypto_executor import PyptoExecutor as CorePyptoExecutor
 from pypto_serving.model.common.executor.utils import build_pypto_run_config
 from pypto_serving.model.common.runner.model_runner import ModelRunner
+from pypto_serving.model.deepseek.expert_offload import v4_expert_slots
 from pypto_serving.model.deepseek.npu_runner import (
     DEEPSEEK_V4_FWD_NUM_LAYERS,
-    DEEPSEEK_V4_LM_HEAD_TP_SIZE,
+    DEEPSEEK_V4_RANKS,
     DeepSeekV4CacheLayout,
     DeepSeekV4CompiledKernels,
     DeepSeekV4L3Callable,
@@ -42,51 +43,6 @@ from pypto_serving.model.deepseek.weight_loader import (
 from pypto_serving.tools.profile import profile_span
 
 _DEEPSEEK_V4_KERNEL_DIRNAME = "deepseek_v4_flash_mtp"
-_DEEPSEEK_V4_IMPORT_MODULES = (
-    "serving_contract",
-    "config",
-    "moe",
-    "decode_moe",
-    "prefill_moe",
-    "combine",
-    "decode_csa",
-    "decode_hca",
-    "decode_swa",
-    "decode_device_state",
-    "decode_fwd",
-    "decode_fwd_mtp",
-    "decode_input_pack",
-    "decode_indexer",
-    "decode_indexer_compressor",
-    "decode_layer",
-    "decode_metadata",
-    "decode_mtp",
-    "decode_mtp_verify",
-    "decode_prepare",
-    "lookup_embedding",
-    "decode_sparse_attn_csa",
-    "decode_sparse_attn_hca",
-    "decode_sparse_attn_swa",
-    "dispatch",
-    "expert_routed",
-    "expert_shared",
-    "gate",
-    "hc_post",
-    "hc_pre",
-    "lm_head",
-    "prefill_csa",
-    "prefill_hca",
-    "prefill_swa",
-    "prefill_indexer_compressor",
-    "prefill_layer",
-    "prefill_mtp",
-    "prefill_fwd",
-    "prefill_sparse_attn",
-    "qkv_proj_rope",
-    "rmsnorm",
-    "sample",
-    "utils",
-)
 
 
 def _find_pypto_lib_deepseek_v4_dir(pypto_lib_root: str | None = None) -> Path:
@@ -181,16 +137,19 @@ def _deepseek_v4_import_context(
     lm_head_tp: int | None = None,
     moe_shape: str | None = None,
     num_layers: int | None = None,
+    experts_per_rank: int | None = None,
 ):
     """Import DeepSeekV4 kernels with fixed EP and LM-head TP arguments."""
     old_argv = list(sys.argv)
     old_path = list(sys.path)
+    # Kernel siblings freeze topology and slot shapes on import.
+    module_names = tuple(path.stem for path in kernel_dir.glob("*.py"))
     missing = object()
     old_modules = {
         module_name: sys.modules.get(module_name, missing)
-        for module_name in _DEEPSEEK_V4_IMPORT_MODULES
+        for module_name in module_names
     }
-    for module_name in _DEEPSEEK_V4_IMPORT_MODULES:
+    for module_name in module_names:
         module = sys.modules.get(module_name)
         module_file = getattr(module, "__file__", None)
         if module_file is not None and _is_deepseek_v4_module_file(Path(module_file), kernel_dir):
@@ -206,6 +165,8 @@ def _deepseek_v4_import_context(
         # prefill_fwd freezes its layer-stack span from ``--num-layers`` at import;
         # serving always packs the full 43-layer forward.
         sys.argv.extend(["--num-layers", str(int(num_layers))])
+    if experts_per_rank is not None:
+        sys.argv.extend(["--experts-per-rank", str(experts_per_rank)])
     sys.path.insert(0, str(kernel_dir))
     sys.path.insert(0, str(pypto_lib_root))
     try:
@@ -233,6 +194,7 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
         pypto_build_dir: str | None = None,
         compile_kernels: bool = False,
         num_speculative_tokens: int = 0,
+        expert_cache_bytes: int = 0,
     ) -> None:
         worker_device_ids = tuple(device_ids) if device_ids is not None else (int(device_id),)
         super().__init__(
@@ -245,6 +207,7 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
         self._kernel_contract = load_deepseek_v4_serving_contract()
         self._compile_kernels = bool(compile_kernels)
         self._num_speculative_tokens = int(num_speculative_tokens)
+        self._expert_cache_bytes = expert_cache_bytes
         if self._num_speculative_tokens < 0:
             raise ValueError("num_speculative_tokens must be non-negative")
         self._embedding_cache: dict[str, torch.Tensor] = {}
@@ -258,13 +221,14 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
                 device_ids=self._device_ids,
                 pypto_build_dir=self._pypto_build_dir,
             ),
+            **({"disable_early_resolve": True} if expert_cache_bytes else {}),
         )
 
     @property
     def max_prefill_batch_size(self) -> int:
         """Return the global DP width: one local prefill request per EP rank."""
         return (
-            DeepSeekV4CacheLayout().ranks
+            (len(self._device_ids) if self._expert_cache_bytes else DEEPSEEK_V4_RANKS)
             * self._kernel_contract.max_prefill_requests_per_partition
         )
 
@@ -352,7 +316,8 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
         # Autoregressive decode keeps the established eight-token tile. MTP uses
         # a 16-token specialization and the smallest power-of-two request-local
         # sequence that can cover one target-verification chunk.
-        layout = deepseek_v4_decode_layout(self._num_speculative_tokens)
+        ranks = len(self._device_ids) if self._expert_cache_bytes else DEEPSEEK_V4_RANKS
+        layout = deepseek_v4_decode_layout(self._num_speculative_tokens, ranks=ranks)
         if layout.prefill_seq != int(self._kernel_contract.prefill_tile_tokens):
             raise ValueError(
                 "DeepSeekV4 serving/kernel prefill tile mismatch: "
@@ -393,6 +358,15 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
         if self._num_speculative_tokens:
             weight_store.validate_mtp_startup_contract(n_routed_experts=n_routed_experts)
 
+        expert_slots = 0
+        if self._expert_cache_bytes:
+            expert_slots = v4_expert_slots(
+                self._expert_cache_bytes, config_data, layers=len(layer_plan), ranks=ranks,
+                hidden=model.config.hidden_size, n_routed_experts=n_routed_experts,
+                prefill_tokens=self._kernel_contract.prefill_moe_tokens_per_rank,
+                decode_tokens=layout.decode_tokens, max_batch_size=model.runtime.max_batch_size,
+            )
+
         layer_compress_ratios = tuple(layer.compress_ratio for layer in layer_plan)
         prepacked_layer_weights: DeepSeekV4StackedLayerWeights | None = None
         if self._compile_kernels:
@@ -409,7 +383,9 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
         mtp_prefill = None
         freqs_cos = freqs_sin = None
         if self._compile_kernels:
-            modules = self._load_kernel_modules(layout)
+            modules = self._load_kernel_modules(
+                layout, expert_slots=expert_slots, n_routed_experts=n_routed_experts,
+            )
             prefill = self._compile_l3_callable(
                 "deepseek_v4_prefill",
                 modules["prefill_fwd"].l3_prefill_fwd,
@@ -470,30 +446,41 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
             n_routed_experts=n_routed_experts,
             num_hash_layers=num_hash_layers,
             num_speculative_tokens=self._num_speculative_tokens,
+            expert_cache_bytes=self._expert_cache_bytes,
         )
 
-    def _load_kernel_modules(self, layout: DeepSeekV4CacheLayout) -> dict[str, object]:
+    def _load_kernel_modules(
+        self, layout: DeepSeekV4CacheLayout, *, expert_slots: int = 0, n_routed_experts: int = 256,
+    ) -> dict[str, object]:
         """Import DeepSeekV4 pypto-lib modules with EP fixed to the serving world size."""
         pypto_lib_root = self._kernel_dir.parents[1]
         ranks = layout.ranks
         fwd_layers = DEEPSEEK_V4_FWD_NUM_LAYERS
+        modules = {}
+        experts_per_rank = n_routed_experts // ranks if expert_slots else None
         with _deepseek_v4_import_context(
             self._kernel_dir,
             pypto_lib_root=pypto_lib_root,
             ep=ranks,
-            lm_head_tp=DEEPSEEK_V4_LM_HEAD_TP_SIZE,
+            lm_head_tp=layout.lm_head_tp,
             moe_shape="prefill",
             num_layers=fwd_layers,
+            experts_per_rank=experts_per_rank,
         ):
-            prefill_layer = importlib.import_module("prefill_layer")
-            prefill_fwd = importlib.import_module("prefill_fwd")
-            prefill_mtp = importlib.import_module("prefill_mtp")
+            if expert_slots:
+                config = importlib.import_module("config")
+                config.EXPERT_SLOTS = expert_slots
+                modules["prefill_fwd"] = importlib.import_module("prefill_fwd")
+            else:
+                for name in ("prefill_layer", "prefill_fwd", "prefill_mtp"):
+                    modules[name] = importlib.import_module(name)
         with _deepseek_v4_import_context(
             self._kernel_dir,
             pypto_lib_root=pypto_lib_root,
             ep=ranks,
-            lm_head_tp=DEEPSEEK_V4_LM_HEAD_TP_SIZE,
+            lm_head_tp=layout.lm_head_tp,
             moe_shape="decode",
+            experts_per_rank=experts_per_rank,
         ):
             config = importlib.import_module("config")
             # pypto-lib freezes B/S into module-level shapes at import. Override
@@ -506,8 +493,12 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
             config.MOE_TOKENS = layout.decode_tokens
             config.DECODE_RECV_MAX = ranks * layout.decode_tokens
             config.RECV_MAX = config.DECODE_RECV_MAX
-            modules = {"config": config}
+            if expert_slots:
+                config.EXPERT_SLOTS = expert_slots
+            modules["config"] = config
             decode_module_names = ["decode_layer", "decode_fwd", "lm_head", "utils"]
+            if expert_slots:
+                decode_module_names.remove("decode_layer")
             if self._num_speculative_tokens:
                 decode_module_names.append("decode_mtp")
             if self._num_speculative_tokens == 1:
@@ -518,9 +509,6 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
                     for name in decode_module_names
                 }
             )
-        modules["prefill_layer"] = prefill_layer
-        modules["prefill_fwd"] = prefill_fwd
-        modules["prefill_mtp"] = prefill_mtp
         return modules
 
     def _compile_l3_callable(
