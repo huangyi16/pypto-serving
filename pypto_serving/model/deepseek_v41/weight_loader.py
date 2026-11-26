@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import json
 import logging
@@ -104,6 +105,25 @@ class _DirectSliceSession(ExitStack):
 
     def load_slice(self, name, ranges, *, shape, dtype):
         path = self.store._slice_path(name, ranges, shape)
+        _path, offset, _shape, torch_dtype = self.tensor_span(name, shape=shape, dtype=dtype)
+        if any(part.start != 0 or part.stop != dim for part, dim in zip(ranges, shape)):
+            with self.store._safe_open_fn(path, self.store.device) as reader:
+                return self.store._checked_slice(reader, name, ranges, shape, dtype)
+        handle = self.files[path][0]
+        data = bytearray(math.prod(shape) * torch_dtype.itemsize)
+        view = memoryview(data)
+        handle.seek(offset)
+        filled = 0
+        while filled < len(data):
+            count = handle.readinto(view[filled:])
+            if not count:
+                raise EOFError(f"short safetensors tensor read: {name}")
+            filled += count
+        return torch.frombuffer(data, dtype=torch_dtype).reshape(shape)
+
+    def tensor_span(self, name, *, shape=None, dtype=None):
+        """Describe validated bytes for direct reads and streamed Host windows."""
+        path = self.store.path_for(name)
         if path not in self.files:
             handle = self.enter_context(path.open("rb", buffering=0))
             size = os.fstat(handle.fileno()).st_size
@@ -117,25 +137,15 @@ class _DirectSliceSession(ExitStack):
             self.files[path] = handle, header, 8 + length, size
         handle, header, data_start, size = self.files[path]
         entry = header[name]
-        if tuple(entry["shape"]) != shape or entry["dtype"] != dtype:
+        if ((shape is not None and tuple(entry["shape"]) != shape)
+                or (dtype is not None and entry["dtype"] != dtype)):
             raise ValueError(f"checkpoint shape/dtype mismatch: {name}")
-        if any(part.start != 0 or part.stop != dim for part, dim in zip(ranges, shape)):
-            with self.store._safe_open_fn(path, self.store.device) as reader:
-                return self.store._checked_slice(reader, name, ranges, shape, dtype)
+        shape, dtype = tuple(entry["shape"]), entry["dtype"]
         start, end = entry["data_offsets"]
         torch_dtype = _TORCH_DTYPES[dtype]
         if not 0 <= start <= end <= size - data_start or end - start != math.prod(shape) * torch_dtype.itemsize:
             raise ValueError(f"invalid safetensors tensor byte range: {name}")
-        data = bytearray(end - start)
-        view = memoryview(data)
-        handle.seek(data_start + start)
-        filled = 0
-        while filled < len(data):
-            count = handle.readinto(view[filled:])
-            if not count:
-                raise EOFError(f"short safetensors tensor read: {name}")
-            filled += count
-        return torch.frombuffer(data, dtype=torch_dtype).reshape(shape)
+        return path, data_start + start, shape, torch_dtype
 
 
 class _V41SafetensorsStore(LazySafetensorsStore):
@@ -202,6 +212,11 @@ class V41WeightLoader:
         self._row_tensors: dict[str, torch.Tensor] = {}
         self._row_tensors_lock = Lock()
 
+    def tensor_span(self, name):
+        """Expose checkpoint bytes to lib's streamed Engram Host-window source."""
+        with _DirectSliceSession(self.store) as session:
+            return session.tensor_span(name)
+
     def names(self, layer_id=None):
         """Selected rank's names; None lists global weights, excluding deferred modules."""
         if layer_id is not None and (type(layer_id) is not int or not 0 <= layer_id < self.config.num_hidden_layers):
@@ -267,6 +282,37 @@ class V41WeightLoader:
         estimate = self._estimate([(name, ranges)])
         return WeightBundle(self._read(name, ranges), None, "vocabulary_rows_bf16", (name,),
                             self.tp_rank, self.ep_rank, estimate)
+
+    def lock_engram_tables(self, layers):
+        """Install shared read-only views for host lookup until the returned stack closes."""
+        by_shard = {}
+        for layer in layers:
+            for field in ("weight", "scale"):
+                name = f"layers.{layer}.engram.embed.{field}"
+                by_shard.setdefault(self.store.path_for(name), []).append(name)
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        with ExitStack() as locks:
+            locked_bytes = 0
+            for path, names in by_shard.items():
+                with path.open("rb") as shard:
+                    mapped = _map_shared_prepacked_tensors(shard.fileno(), names)
+                for name, tensor in mapped.items():
+                    expected = torch.float8_e8m0fnu if name.endswith(".scale") else torch.float8_e4m3fn
+                    if tensor.ndim != 2 or tensor.dtype != expected:
+                        raise ValueError(f"unsupported Engram table layout: {name}")
+                    address = ctypes.c_void_p(tensor.data_ptr())
+                    size = ctypes.c_size_t(tensor.nbytes)
+                    if libc.mlock(address, size) != 0:
+                        error = ctypes.get_errno()
+                        raise OSError(error, f"mlock failed for {name} ({size.value} bytes): "
+                                            f"{os.strerror(error)}; check RLIMIT_MEMLOCK")
+                    self._row_tensors[name] = tensor
+                    locks.callback(self._row_tensors.pop, name)
+                    locks.callback(libc.munlock, address, size)
+                    locked_bytes += tensor.nbytes
+            logging.getLogger(__name__).info("V4.1 Engram locked %d host bytes", locked_bytes)
+            return locks.pop_all()
 
     def tensor_rows(self, name, rows):
         """Read arbitrary rows from an auxiliary host-offloaded tensor.
@@ -824,8 +870,8 @@ def iter_decode_weight_slices(model_dir, topology, *, max_bundle_bytes=32 << 30,
     raw = json.loads((Path(model_dir) / "config.json").read_text(encoding="utf-8"))
     layers = plan_layers(raw)
     if (len(layers) != 40 or topology.tp != 1
-            or topology.dp not in (4, 8) or topology.world != topology.dp):
-        raise ValueError("V4.1 requires the 40-layer TP1/DP4/EP4 or TP1/DP8/EP8 schedule")
+            or topology.dp not in (1, 2, 4, 8) or topology.world != topology.dp):
+        raise ValueError("V4.1 requires a 40-layer TP1 schedule with matching DP and EP")
     text = raw["text_config"]
     kv_sources = tuple(text["kv_source_layer_ids"])
     index_sources = tuple(text["index_source_layer_ids"])

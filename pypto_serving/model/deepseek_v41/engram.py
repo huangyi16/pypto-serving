@@ -9,8 +9,9 @@
 """Host-side DeepSeek V4.1 Engram hashing and row lookup.
 
 The text path follows the readable reference implementation shipped with the
-official DeepSeek V4.1 model. Serving owns the host state and table reads;
-pypto-lib is only used for the device Engram kernels and their ABI.
+official DeepSeek V4.1 model. Serving owns token history and hashes; pypto-lib
+provides Host table windows and device lookup kernels. CPU row lookup remains
+available for reference checks.
 """
 
 from __future__ import annotations

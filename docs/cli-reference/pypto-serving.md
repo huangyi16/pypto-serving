@@ -70,6 +70,7 @@ Device count and the meaning of each parallel axis depend on the model's placeme
 | --- | --- | --- |
 | `--max-model-len` | `1024` | Maximum prompt plus generated token length. |
 | `--block-size` | `128` | KV cache block size. |
+| `--moe-offload-bytes` | `0` | HBM budget in bytes per rank for V4.1 packed routed expert slots. Zero keeps the resident path. |
 | `--npu-memory-utilization` | `0.90` | Fraction of NPU memory available to the server. |
 | `--max-num-seqs` | `16`; PD decode: `72` | Maximum concurrent requests and cache-planning capacity. PD prefill defaults to `16`; explicit values override the default. |
 | `--max-num-batched-tokens` | `4096` | Maximum scheduled tokens per iteration. |
@@ -78,6 +79,8 @@ Device count and the meaning of each parallel axis depend on the model's placeme
 | `--ring-dep-pool` | runtime default | Simpler ring dependency-edge pool capacity. A single integer broadcasts to all scope-depth rings; a comma-separated four-integer list sizes rings 0..3, with `0` leaving that ring at its default. |
 | `--ring-task-window` | runtime default | Simpler ring task-slot window capacity. Accepts the same single integer or four-entry list form as `--ring-dep-pool`. |
 | `--ring-heap` | runtime default | Simpler per-ring output-heap size in bytes. Accepts the same single integer or four-entry list form as `--ring-dep-pool`. |
+
+DeepSeek V4.1 streams the Engram embedding and scale tables into runtime-owned Host windows on each compiled forward's first dispatch. Source files stay open until the worker closes. Each forward owns its windows, in both resident and offloaded MoE modes. Host memory must cover both prefill and decode tables (plus the target DSpark forward when enabled). The former `PYPTO_V41_ENGRAM_RESIDENT` setting is no longer used; serving stages INT32 hash IDs instead of looking up and dequantizing table rows on the CPU.
 
 ### Capacity Semantics
 
@@ -88,6 +91,18 @@ Continuous batching keeps multiple requests active across engine iterations. Req
 Cache layout and capacity constraints depend on the model executor. Some models use the generic paged KV cache; others allocate model-specific cache pools. Check the model guide when sizing `--max-model-len`, `--block-size`, and concurrent requests.
 
 The ring options size Simpler runtime queues and output heap capacity. A single integer applies to every scope-depth ring; a four-entry list controls rings 0 through 3, with `0` preserving that ring's runtime default.
+
+With a positive MoE budget, prefill and decode share the routed expert slots. Other
+weights, pool metadata, compute scratch, and KV caches consume additional HBM.
+The adapter targets standalone generation with TP1 and matching DP and EP
+(EP1/2/4/8) on A5. At EP1, `--max-num-seqs` defaults to 12. Grouped prefill
+requires space for a layer of rank-local experts. Each V4.1 FP4 expert occupies
+18,800,640 bytes including its MX scales, with 384 experts split across EP ranks.
+
+Allow host memory for the checkpoint and the per-rank mapped windows and size
+`/dev/shm` for all local ranks. Loading V4.1 directly from checkpoint without
+a prepacked sidecar also spills all routed weights to `TMPDIR` before creating
+the worker (about 269 GiB for the full model). Setup removes the temporary files.
 
 ## Serving Arguments
 
